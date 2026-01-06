@@ -288,3 +288,192 @@ JWT_SECRET=your_super_secret_key_123
 4.  **Dev:** Can create reports. In `updateReportStatus`, a check is added to ensure they can only review reports where the creator is a `jrDev`.
 5.  **JrDev:** Restricted via `authorize` middleware to only create/view. `getReports` filters by `createdBy: req.user._id`.
 6.  **Auth:** `protect` middleware ensures the user is logged in and their `isActive` flag is true.
+
+
+
+This follows the logic where the **Manager** primarily creates and manages teams, and the **Admin** has the power to override or change them.
+
+### 1. Updated Team Model (`models/Team.js`)
+This model stores the relationship between the leader and the members.
+
+```javascript
+const mongoose = require('mongoose');
+
+const TeamSchema = new mongoose.Schema({
+    name: { 
+        type: String, 
+        required: true, 
+        unique: true 
+    },
+    teamLeader: { 
+        type: mongoose.Schema.Types.ObjectId, 
+        ref: 'User', 
+        required: true 
+    },
+    members: [{ 
+        type: mongoose.Schema.Types.ObjectId, 
+        ref: 'User' 
+    }],
+    manager: { 
+        type: mongoose.Schema.Types.ObjectId, 
+        ref: 'User', 
+        required: true 
+    }, // The manager who oversees this team
+}, { timestamps: true });
+
+module.exports = mongoose.model('Team', TeamSchema);
+```
+
+---
+
+### 2. Team Controller (`controllers/teamController.js`)
+This controller handles the logic of assigning roles and ensuring users are updated when their team assignment changes.
+
+```javascript
+const Team = require('../models/Team');
+const User = require('../models/User');
+
+// @desc    Create a new team and assign members
+// @route   POST /api/teams
+// @access  Private (Admin, Manager)
+exports.createTeam = async (req, res) => {
+    try {
+        const { name, teamLeaderId, memberIds } = req.body;
+
+        // 1. Create the team
+        const team = await Team.create({
+            name,
+            teamLeader: teamLeaderId,
+            members: memberIds,
+            manager: req.user._id // The manager creating the team
+        });
+
+        // 2. Update the Team Leader's teamId in User model
+        await User.findByIdAndUpdate(teamLeaderId, { teamId: team._id });
+
+        // 3. Update all members' teamId in User model
+        await User.updateMany(
+            { _id: { $in: memberIds } },
+            { teamId: team._id }
+        );
+
+        res.status(201).json({ message: "Team created and members assigned", team });
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+};
+
+// @desc    Get all teams
+// @route   GET /api/teams
+// @access  Private (Admin, Manager)
+exports.getAllTeams = async (req, res) => {
+    try {
+        const teams = await Team.find()
+            .populate('teamLeader', 'name email')
+            .populate('members', 'name email role')
+            .populate('manager', 'name');
+        res.json(teams);
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+};
+
+// @desc    Update team members (Change the team)
+// @route   PUT /api/teams/:id/members
+// @access  Private (Admin, Manager)
+exports.updateTeamMembers = async (req, res) => {
+    try {
+        const { memberIds } = req.body; // New array of member IDs
+        const team = await Team.findById(req.params.id);
+
+        if (!team) return res.status(404).json({ message: "Team not found" });
+
+        // Remove teamId from old members who are no longer in this list
+        await User.updateMany(
+            { teamId: team._id },
+            { $set: { teamId: null } }
+        );
+
+        // Update team document
+        team.members = memberIds;
+        await team.save();
+
+        // Update new members with this teamId
+        await User.updateMany(
+            { _id: { $in: memberIds } },
+            { $set: { teamId: team._id } }
+        );
+
+        res.json({ message: "Team members updated successfully", team });
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+};
+
+// @desc    Get specific team details (Used by TL or Devs to see their teammates)
+// @route   GET /api/teams/my-team
+// @access  Private (All roles)
+exports.getMyTeam = async (req, res) => {
+    try {
+        if (!req.user.teamId) {
+            return res.status(404).json({ message: "You are not assigned to any team" });
+        }
+        const team = await Team.findById(req.user.teamId)
+            .populate('teamLeader', 'name email')
+            .populate('members', 'name email role');
+        res.json(team);
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+};
+```
+
+---
+
+### 3. Team Routes (`routes/teamRoutes.js`)
+
+```javascript
+const express = require('express');
+const router = express.Router();
+const { 
+    createTeam, 
+    getAllTeams, 
+    updateTeamMembers, 
+    getMyTeam 
+} = require('../controllers/teamController');
+
+const { protect } = require('../middlewares/authMiddleware');
+const { authorize } = require('../middlewares/roleMiddleware');
+
+// Standard team management (Restricted to Manager and Admin)
+router.route('/')
+    .post(protect, authorize('admin', 'manager'), createTeam)
+    .get(protect, authorize('admin', 'manager'), getAllTeams);
+
+// Specific route for users to see their own team members
+router.get('/my-team', protect, getMyTeam);
+
+// Route for Admin/Manager to change team composition
+router.put('/:id/members', protect, authorize('admin', 'manager'), updateTeamMembers);
+
+module.exports = router;
+```
+
+---
+
+### 4. Integrating into `app.js`
+Ensure you have the route registered in your main entry file:
+
+```javascript
+// ... other imports
+const teamRoutes = require('./routes/teamRoutes');
+
+// ... other middlewares
+app.use('/api/teams', teamRoutes);
+```
+
+### How this meets your requirements:
+1.  **Manager Control:** The `createTeam` and `updateTeamMembers` logic allows the Manager to pick which Team Leader, Dev, and JrDev belong together.
+2.  **Admin Override:** Since the `authorize` middleware includes `'admin'`, the Admin can also "Change the team" as requested.
+3.  **Data Integrity:** When a team is created or updated, the `User` model's `teamId` field is automatically synced. This is crucial for the **Team Leader** and **Dev** report-viewing logic (they use `req.user.teamId` to filter reports).
+4.  **Security:** A `jrDev` cannot access `GET /api/teams` to see all company teams; they can only use `GET /api/teams/my-team` to see their own colleagues.
